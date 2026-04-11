@@ -1,0 +1,16 @@
+services:
+  qq-bridge:
+    build: .
+    container_name: qq-bridge
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Claude Code 认证信息（在宿主机先登录好：claude login）
+      - ~/.claude:/root/.claude:ro
+      # 可选：把宿主机某目录挂进容器，让 shell 命令能操作它
+      # - /your/host/path:/workspace
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

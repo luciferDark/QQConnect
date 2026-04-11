@@ -45,6 +45,7 @@ from textual.containers import Horizontal
 
 from session_manager import SessionManager, MODELS, DEFAULT_SYSTEM
 from claude_client import ClaudeClient
+from codex_client import CodexClient
 from shell_session import get_shell
 
 load_dotenv()
@@ -55,6 +56,10 @@ API_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
 MODEL         = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 MAX_TURNS     = int(os.getenv("MAX_HISTORY_TURNS", "20"))
 MAX_MSG_LEN   = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
+
+CODEX_BASE_URL = os.getenv("CODEX_BASE_URL", "")
+CODEX_API_KEY  = os.getenv("CODEX_API_KEY", "")
+CODEX_MODEL    = os.getenv("CODEX_MODEL", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TUI App
@@ -106,6 +111,11 @@ class QQTerminalApp(App):
     def on_mount(self) -> None:
         self._sessions   = SessionManager(max_turns=MAX_TURNS)
         self._claude     = ClaudeClient(api_key=API_KEY, model=MODEL)
+        self._codex      = CodexClient(
+            base_url=CODEX_BASE_URL,
+            api_key=CODEX_API_KEY,
+            model=CODEX_MODEL,
+        ) if CODEX_BASE_URL else None
 
         self._chat_log  = self.query_one("#chat-panel",  RichLog)
         self._shell_log = self.query_one("#shell-panel", RichLog)
@@ -177,6 +187,9 @@ class QQTerminalApp(App):
                 "  /del <名>    删除会话\n"
                 "  /ctx          查看当前会话详情\n"
                 "  /clear        清空当前会话历史\n\n"
+                "【模型后端】\n"
+                "  /codex        切换到 Codex（本地模型）\n"
+                "  /claude       切换到 Claude CLI\n\n"
                 "【模型】\n"
                 "  /models       列出可用模型\n"
                 "  /model [别名] 查看/切换模型\n\n"
@@ -185,6 +198,25 @@ class QQTerminalApp(App):
                 "  /trim <n>    只保留最近 n 轮"
             )
             await reply_func(msg)
+            return
+
+        # ── /codex ────────────────────────────────────────────────────────────
+        if lower == "/codex":
+            if not self._codex:
+                await reply_func("⚠️ Codex 未配置，请在 .env 中填写 CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL")
+                return
+            ctx.session.backend = "codex"
+            ctx.clear()
+            self._update_status(session_id)
+            await reply_func(f"🤖 已切换到 Codex 模式（{CODEX_MODEL}）\n历史已清空")
+            return
+
+        # ── /claude ───────────────────────────────────────────────────────────
+        if lower == "/claude":
+            ctx.session.backend = "claude"
+            ctx.clear()
+            self._update_status(session_id)
+            await reply_func(f"🧠 已切换到 Claude 模式（{ctx.session.model}）\n历史已清空")
             return
 
         # ── /shell ────────────────────────────────────────────────────────────
@@ -367,13 +399,22 @@ class QQTerminalApp(App):
                 await reply_func(part)
             return
 
-        # ── Chat 模式：发给 Claude ────────────────────────────────────────────
+        # ── Chat 模式：按 backend 路由 ────────────────────────────────────────
+        backend = ctx.session.backend
         try:
-            reply = await asyncio.to_thread(
-                self._claude.chat, self._sessions, session_id, content
-            )
+            if backend == "codex":
+                if not self._codex:
+                    reply = "⚠️ Codex 未配置，请先在 .env 填写配置后重启，或用 /claude 切换回 Claude"
+                else:
+                    reply = await asyncio.to_thread(
+                        self._codex.chat, self._sessions, session_id, content
+                    )
+            else:
+                reply = await asyncio.to_thread(
+                    self._claude.chat, self._sessions, session_id, content
+                )
         except Exception as e:
-            reply = f"⚠️ Claude 出错：{str(e)[:200]}"
+            reply = f"⚠️ {backend} 出错：{str(e)[:200]}"
 
         self._chat_log.write(f"[green]◀ Claude:[/] {reply[:120]}{'...' if len(reply)>120 else ''}")
         self._update_status(session_id)

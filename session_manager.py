@@ -41,6 +41,7 @@ class ChatSession:
     model:      str      = DEFAULT_MODEL
     system:     str      = DEFAULT_SYSTEM
     history:    list     = field(default_factory=list)
+    backend:    str      = "codex"    # "claude" | "codex"
     created_at: float    = field(default_factory=time.time)
     updated_at: float    = field(default_factory=time.time)
 
@@ -86,6 +87,7 @@ class ChatSession:
         age = datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
         return (
             f"会话：{self.name}\n"
+            f"后端：{self.backend}\n"
             f"模型：{self.model}\n"
             f"对话轮数：{self.turn_count}\n"
             f"消息条数：{len(self.history)}\n"
