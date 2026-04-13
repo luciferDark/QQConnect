@@ -15,35 +15,40 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-# ── 可用模型表 ────────────────────────────────────────────────────────────────
-MODELS: dict[str, str] = {
-    # 别名       → 完整模型 ID
-    "opus":      "claude-opus-4-6",
-    "gpt":      "gpt-4-1",
-    "sonnet":    "claude-sonnet-4-6",
-    "haiku":     "claude-haiku-4-5",
-    # 也接受完整名
-    "claude-opus-4-6":    "claude-opus-4-6",
-    "claude-sonnet-4-6":  "claude-sonnet-4-6",
-    "claude-haiku-4-5":   "claude-haiku-4-5",
-    "gpt-4-1":    "gpt-4-1",
+# ── Claude 模型表 ─────────────────────────────────────────────────────────────
+CLAUDE_MODELS: dict[str, str] = {
+    "opus":             "claude-opus-4-6",
+    "sonnet":           "claude-sonnet-4-6",
+    "haiku":            "claude-haiku-4-5",
+    "claude-opus-4-6":   "claude-opus-4-6",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "claude-haiku-4-5":  "claude-haiku-4-5",
 }
-DEFAULT_MODEL   = "gpt-4-1"
+DEFAULT_CLAUDE_MODEL = "claude-opus-4-6"
+
+# ── Codex 默认模型（从 env 读，运行时覆盖；此处仅占位）─────────────────────────
+DEFAULT_CODEX_MODEL  = ""   # 由 tui.py / bot_headless.py 启动时写入
+
+# 向后兼容：外部代码 import MODELS 不报错
+MODELS = CLAUDE_MODELS
+
+DEFAULT_MODEL   = DEFAULT_CLAUDE_MODEL   # 保持字段默认值不变
 DEFAULT_SYSTEM  = "你是一个有帮助的AI助手。回答要清晰、准确、简洁。支持中英文对话。"
-MAX_SESSIONS    = 10     # 每用户最多会话数
-MAX_TURNS       = 20     # 默认每会话最多保留轮数
+MAX_SESSIONS    = 10
+MAX_TURNS       = 20
 
 
 # ── ChatSession ───────────────────────────────────────────────────────────────
 @dataclass
 class ChatSession:
-    name:       str
-    model:      str      = DEFAULT_MODEL
-    system:     str      = DEFAULT_SYSTEM
-    history:    list     = field(default_factory=list)
-    backend:    str      = "codex"    # "claude" | "codex"
-    created_at: float    = field(default_factory=time.time)
-    updated_at: float    = field(default_factory=time.time)
+    name:        str
+    model:       str   = DEFAULT_CLAUDE_MODEL   # Claude 模型
+    codex_model: str   = ""                     # Codex / Codex-CLI 模型（空则用全局默认）
+    system:      str   = DEFAULT_SYSTEM
+    history:     list  = field(default_factory=list)
+    backend:     str   = "codex-cli"             # "claude" | "codex" | "codex-cli"
+    created_at:  float = field(default_factory=time.time)
+    updated_at:  float = field(default_factory=time.time)
 
     # ── 历史操作 ──────────────────────────────────────────────────────────────
     def add_user(self, content: str, max_turns: int = MAX_TURNS):
@@ -77,18 +82,32 @@ class ChatSession:
         return sum(1 for m in self.history if m["role"] == "user")
 
     @property
+    def active_model(self) -> str:
+        """当前后端实际使用的模型名。"""
+        if self.backend == "claude":
+            return self.model
+        return self.codex_model or DEFAULT_CODEX_MODEL
+
+    @property
     def model_short(self) -> str:
-        for alias, full in MODELS.items():
-            if full == self.model and len(alias) <= 6:
-                return alias
-        return self.model.split("-")[-1]  # fallback
+        if self.backend == "claude":
+            for alias, full in CLAUDE_MODELS.items():
+                if full == self.model and len(alias) <= 6:
+                    return alias
+            return self.model.split("-")[-1]
+        m = self.codex_model or DEFAULT_CODEX_MODEL
+        return m.split("/")[-1][:10]  # 取最后一段，最多10字符
 
     def info(self) -> str:
         age = datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
+        if self.backend == "claude":
+            model_line = f"Claude 模型：{self.model}"
+        else:
+            model_line = f"Codex 模型：{self.codex_model or DEFAULT_CODEX_MODEL}"
         return (
             f"会话：{self.name}\n"
             f"后端：{self.backend}\n"
-            f"模型：{self.model}\n"
+            f"{model_line}\n"
             f"对话轮数：{self.turn_count}\n"
             f"消息条数：{len(self.history)}\n"
             f"系统提示：{'(默认)' if self.system == DEFAULT_SYSTEM else self.system[:60]}\n"
@@ -205,12 +224,59 @@ class SessionManager:
         self._max_turns = max_turns
         self._users: dict[str, UserContext] = {}
         self._last_active: dict[str, float] = {}
+        self._store = None   # 延迟绑定 DataStore，避免循环导入
+
+    def _get_store(self):
+        if self._store is None:
+            from data_store import get_store
+            self._store = get_store()
+        return self._store
+
+    def restore_from_disk(self) -> int:
+        """启动时从磁盘恢复所有会话，返回恢复用户数。"""
+        from data_store import get_store
+        from session_manager import ChatSession
+        store    = get_store()
+        all_data = store.load_all_sessions()
+        count    = 0
+        for user_key, data in all_data.items():
+            ctx = UserContext(self._max_turns)
+            ctx._sessions.clear()
+            for name, sd in data.get("sessions", {}).items():
+                sess = ChatSession(
+                    name       = sd["name"],
+                    model       = sd.get("model", DEFAULT_CLAUDE_MODEL),
+                    codex_model = sd.get("codex_model", ""),
+                    system      = sd.get("system", DEFAULT_SYSTEM),
+                    history     = sd.get("history", []),
+                    backend     = sd.get("backend", "codex-cli"),
+                    created_at  = sd.get("created_at", time.time()),
+                    updated_at  = sd.get("updated_at", time.time()),
+                )
+                ctx._sessions[name] = sess
+            active = data.get("active", "")
+            if active in ctx._sessions:
+                ctx._active = active
+            elif ctx._sessions:
+                ctx._active = next(iter(ctx._sessions))
+            else:
+                ctx._new_session("default")
+            ctx.shell_mode = data.get("shell_mode", False)
+            self._users[user_key] = ctx
+            self._last_active[user_key] = time.time()
+            count += 1
+        return count
 
     def get(self, user_key: str) -> UserContext:
         if user_key not in self._users:
             self._users[user_key] = UserContext(self._max_turns)
         self._last_active[user_key] = time.time()
         return self._users[user_key]
+
+    def save(self, user_key: str) -> None:
+        """持久化单个用户到磁盘。"""
+        if user_key in self._users:
+            self._get_store().save_user(user_key, self._users[user_key])
 
     def total_users(self) -> int:
         return len(self._users)

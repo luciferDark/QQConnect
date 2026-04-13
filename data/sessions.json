@@ -1,0 +1,67 @@
+{
+  "c2c_EDADB878E72656DF2755E6612DD190CE": {
+    "active": "default",
+    "shell_mode": false,
+    "sessions": {
+      "default": {
+        "name": "default",
+        "backend": "codex-cli",
+        "model": "claude-opus-4-6",
+        "codex_model": "",
+        "system": "你是一个有帮助的AI助手。回答要清晰、准确、简洁。支持中英文对话。",
+        "history": [
+          {
+            "role": "user",
+            "content": "你好"
+          },
+          {
+            "role": "assistant",
+            "content": "��ã���ʲô�ҿ��԰������"
+          },
+          {
+            "role": "user",
+            "content": "/modex"
+          },
+          {
+            "role": "assistant",
+            "content": "���л��� **ģʽ X**��  \r\n��������������Ҫ��ʲô��"
+          },
+          {
+            "role": "user",
+            "content": "使用的是什么模型"
+          },
+          {
+            "role": "assistant",
+            "content": "我是由 OpenAI 提供的 AI 助手，但我在这个对话里看不到底层具体模型名称或版本号。  \r\n如果这是某个平台接入的 API，实际模型名通常要看：\r\n\r\n- 你的调用参数里的 `model`\r\n- 平台控制台/日志\r\n- 或应用开发者的配置\r\n\r\n如果你愿意，我也可以帮你判断怎么在你的环境里查看当前用的是哪个模型。"
+          },
+          {
+            "role": "user",
+            "content": "li"
+          },
+          {
+            "role": "assistant",
+            "content": "你好。  \r\n你发的 “li” 可能是：\r\n\r\n- 想继续输入，但还没发完整\r\n- 想问某个拼音缩写\r\n- 想测试我是否在线\r\n\r\n如果你是想继续刚才的话题：  \r\n**我无法直接看到当前底层模型名**，需要看你使用平台的 API 配置或控制台。\r\n\r\n如果你愿意，也可以直接告诉我你想表达的内容，我继续帮你。"
+          },
+          {
+            "role": "user",
+            "content": "ls"
+          },
+          {
+            "role": "assistant",
+            "content": "`ls` 通常是 Unix/Linux/macOS 终端里“列出目录内容”的命令。\r\n\r\n常见用法：\r\n- `ls`：列出当前目录文件\r\n- `ls -l`：详细列表\r\n- `ls -a`：显示隐藏文件\r\n- `ls -la`：详细显示全部文件\r\n- `ls /path/to/dir`：查看指定目录\r\n\r\n如果你是在这个聊天里输入 `ls`，我不能直接访问你的本地文件系统或替你执行终端命令。  \r\n但我可以：\r\n\r\n- 帮你解释命令\r\n- 帮你写 shell 命令\r\n- 分析你贴出来的 `ls` 输出\r\n\r\n如果你想，我也可以继续给你讲 `pwd`、`cd`、`mkdir`、`rm` 这些基础命令。"
+          },
+          {
+            "role": "user",
+            "content": "model"
+          },
+          {
+            "role": "assistant",
+            "content": "我不知道当前会话绑定的**具体模型 ID/版本**。我只能确认：我是 **OpenAI 的 AI 助手**。  \r\n要查看“实际在用哪个 model”，通常看：\r\n\r\n- **API 请求参数**里的 `model`\r\n- 你的 **平台控制台/日志**\r\n- 应用或中间层的 **配置文件**\r\n\r\n如果你告诉我你是在哪个平台/SDK里用的，我可以直接告诉你去哪里看。"
+          }
+        ],
+        "created_at": 1775917399.969542,
+        "updated_at": 1775962098.6358187
+      }
+    }
+  }
+}

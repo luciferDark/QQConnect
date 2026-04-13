@@ -14,6 +14,8 @@ import os
 from openai import OpenAI
 from session_manager import SessionManager
 from shell_session import get_shell
+from skill_loader import load_skill, list_skills_text, create_skill, write_skill, delete_skill
+from data_store import get_store
 
 # ── 工具定义 ──────────────────────────────────────────────────────────────────
 TOOLS = [
@@ -83,6 +85,83 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill",
+            "description": (
+                "Load the full instructions of a global Claude Code skill by name. "
+                "Call this FIRST when the user asks you to use a skill (e.g. 'use lark-im to send a message'). "
+                "After reading, follow the skill's instructions to complete the task using run_shell."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name, e.g. 'lark-im', 'lark-doc'. Use list_skills first if unsure.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "List all available global Claude Code skills on this machine.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": (
+                "Create a new global Claude Code skill with a SKILL.md file. "
+                "Use this when the user asks to create a new skill or tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":        {"type": "string", "description": "Skill name (no spaces, e.g. 'my-tool')"},
+                    "description": {"type": "string", "description": "One-line description of what the skill does"},
+                    "content":     {"type": "string", "description": "Full SKILL.md content (markdown). Leave empty to generate a skeleton."},
+                },
+                "required": ["name", "description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_skill",
+            "description": "Overwrite the SKILL.md of an existing skill with new content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name":    {"type": "string", "description": "Skill name"},
+                    "content": {"type": "string", "description": "New SKILL.md content"},
+                },
+                "required": ["name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_skill",
+            "description": "Delete a skill directory entirely.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name to delete"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 MAX_TOOL_ITER = 20   # 防止无限循环
@@ -114,12 +193,15 @@ class CodexClient:
             messages.append({"role": "system", "content": sess.system})
         messages.extend(ctx.get_history())
 
+        # 使用会话级 codex_model，回退到客户端默认模型
+        model = sess.codex_model or self._model
+
         # 3. 工具调用循环
         tool_summary: list[str] = []
         try:
             for _ in range(MAX_TOOL_ITER):
                 response = self._client.chat.completions.create(
-                    model=self._model,
+                    model=model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
@@ -169,6 +251,16 @@ class CodexClient:
 
         # 5. 存入助手回复（只存最终文本，不存中间工具消息）
         ctx.add_assistant(full_reply)
+
+        # 6. Token 统计（从最后一次 API 响应取 usage）
+        try:
+            u = response.usage
+            get_store().record_tokens(session_id, sess.name, "codex", u.prompt_tokens, u.completion_tokens)
+        except Exception:
+            pass
+
+        # 7. 持久化
+        session_manager.save(session_id)
         return full_reply
 
     # ── 工具分发 ──────────────────────────────────────────────────────────────
@@ -181,6 +273,16 @@ class CodexClient:
             return shell.execute(args["command"])
         if name == "list_directory":
             return self._list_dir(args.get("path", "."), shell.cwd)
+        if name == "read_skill":
+            return load_skill(args["name"])
+        if name == "list_skills":
+            return list_skills_text()
+        if name == "create_skill":
+            return create_skill(args["name"], args.get("description", ""), args.get("content", ""))
+        if name == "write_skill":
+            return write_skill(args["name"], args["content"])
+        if name == "delete_skill":
+            return delete_skill(args["name"])
         return f"未知工具：{name}"
 
     # ── 工具实现 ──────────────────────────────────────────────────────────────

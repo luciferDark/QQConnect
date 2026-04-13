@@ -43,10 +43,13 @@ from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, RichLog, Static
 from textual.containers import Horizontal
 
-from session_manager import SessionManager, MODELS, DEFAULT_SYSTEM
+from session_manager import SessionManager, CLAUDE_MODELS, DEFAULT_SYSTEM
+import session_manager as _sm
 from claude_client import ClaudeClient
 from codex_client import CodexClient
+from codex_cli_client import CodexCliClient
 from shell_session import get_shell
+from skill_loader import list_skills_text, load_skill, create_skill, write_skill, delete_skill
 
 load_dotenv()
 
@@ -56,6 +59,7 @@ API_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
 MODEL         = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 MAX_TURNS     = int(os.getenv("MAX_HISTORY_TURNS", "20"))
 MAX_MSG_LEN   = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
+ADMIN_PORT    = int(os.getenv("ADMIN_PORT", "12321"))
 
 CODEX_BASE_URL = os.getenv("CODEX_BASE_URL", "")
 CODEX_API_KEY  = os.getenv("CODEX_API_KEY", "")
@@ -109,9 +113,21 @@ class QQTerminalApp(App):
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     def on_mount(self) -> None:
+        _sm.DEFAULT_CODEX_MODEL = CODEX_MODEL   # 注入全局默认 Codex 模型
+
         self._sessions   = SessionManager(max_turns=MAX_TURNS)
+        restored = self._sessions.restore_from_disk()
+
+        import app_state
+        app_state.set_sessions(self._sessions)   # 暴露给 admin server
+
         self._claude     = ClaudeClient(api_key=API_KEY, model=MODEL)
         self._codex      = CodexClient(
+            base_url=CODEX_BASE_URL,
+            api_key=CODEX_API_KEY,
+            model=CODEX_MODEL,
+        ) if CODEX_BASE_URL else None
+        self._codex_cli  = CodexCliClient(
             base_url=CODEX_BASE_URL,
             api_key=CODEX_API_KEY,
             model=CODEX_MODEL,
@@ -125,6 +141,12 @@ class QQTerminalApp(App):
         self._shell_log.write("[bold cyan]═══ Shell 输出 ═══[/]")
 
         asyncio.create_task(self._start_bot())
+        asyncio.create_task(self._start_admin())
+
+    async def _start_admin(self) -> None:
+        from admin_server import start_admin
+        self._chat_log.write(f"[bold cyan]🌐 Admin UI: http://localhost:{ADMIN_PORT}[/]")
+        await start_admin(ADMIN_PORT)
 
     async def _start_bot(self) -> None:
         self._update_status()
@@ -200,15 +222,21 @@ class QQTerminalApp(App):
             await reply_func(msg)
             return
 
-        # ── /codex ────────────────────────────────────────────────────────────
-        if lower == "/codex":
+        # ── /codex [api|cli] ──────────────────────────────────────────────────
+        if lower in ("/codex", "/codex api", "/codex cli"):
             if not self._codex:
                 await reply_func("⚠️ Codex 未配置，请在 .env 中填写 CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL")
                 return
-            ctx.session.backend = "codex"
+            sub = lower.split()[-1]          # "codex" / "api" / "cli"
+            if sub == "cli":
+                ctx.session.backend = "codex-cli"
+                label = "Codex CLI（openai api chat.completions.create）"
+            else:
+                ctx.session.backend = "codex"
+                label = "Codex API（SDK）"
             ctx.clear()
             self._update_status(session_id)
-            await reply_func(f"🤖 已切换到 Codex 模式（{CODEX_MODEL}）\n历史已清空")
+            await reply_func(f"🤖 已切换到 {label}\n模型：{CODEX_MODEL}，历史已清空")
             return
 
         # ── /claude ───────────────────────────────────────────────────────────
@@ -265,13 +293,23 @@ class QQTerminalApp(App):
 
         # ── /models ───────────────────────────────────────────────────────────
         if lower == "/models":
-            lines = ["可用模型："]
-            seen = set()
-            for alias, full in MODELS.items():
-                if full not in seen and len(alias) <= 6:
-                    marker = "▶" if full == ctx.session.model else " "
-                    lines.append(f"  {marker} {alias:<8} → {full}")
-                    seen.add(full)
+            backend = ctx.session.backend
+            if backend == "claude":
+                lines = ["Claude 可用模型："]
+                seen = set()
+                for alias, full in CLAUDE_MODELS.items():
+                    if full not in seen and len(alias) <= 6:
+                        marker = "▶" if full == ctx.session.model else " "
+                        lines.append(f"  {marker} {alias:<8} → {full}")
+                        seen.add(full)
+            else:
+                cur = ctx.session.codex_model or CODEX_MODEL
+                lines = [
+                    f"Codex 当前模型：{cur}",
+                    "",
+                    "用 /model <模型名> 切换到任意模型",
+                    "（模型名由你的 API 服务端决定）",
+                ]
             await reply_func("\n".join(lines))
             return
 
@@ -316,22 +354,26 @@ class QQTerminalApp(App):
             await reply_func(msg)
             return
 
-        # ── /model [别名] ─────────────────────────────────────────────────────
+        # ── /model [名称] ─────────────────────────────────────────────────────
         if lower == "/model" or lower.startswith("/model "):
-            arg = content[6:].strip()
+            arg     = content[6:].strip()
+            backend = ctx.session.backend
             if not arg:
-                await reply_func(f"当前模型：{ctx.session.model}")
+                await reply_func(f"当前模型：{ctx.session.active_model}")
                 return
-            key = arg.lower()
-            if key not in MODELS:
-                await reply_func(
-                    f"未知模型：{arg}\n"
-                    f"可用别名：{', '.join(k for k in MODELS if len(k) <= 6)}"
-                )
-                return
-            ctx.session.model = MODELS[key]
-            self._update_status(session_id)
-            await reply_func(f"✅ 已将当前会话模型切换为：{ctx.session.model}")
+            if backend == "claude":
+                key = arg.lower()
+                if key not in CLAUDE_MODELS:
+                    aliases = ", ".join(k for k in CLAUDE_MODELS if len(k) <= 6)
+                    await reply_func(f"未知 Claude 模型：{arg}\n可用别名：{aliases}")
+                    return
+                ctx.session.model = CLAUDE_MODELS[key]
+                self._update_status(session_id)
+                await reply_func(f"✅ Claude 模型已切换为：{ctx.session.model}")
+            else:
+                ctx.session.codex_model = arg
+                self._update_status(session_id)
+                await reply_func(f"✅ Codex 模型已切换为：{arg}")
             return
 
         # ── /system [文字] ────────────────────────────────────────────────────
@@ -360,6 +402,77 @@ class QQTerminalApp(App):
             ctx.session.trim_to(n)
             self._update_status(session_id)
             await reply_func(f"✅ 已裁剪，当前保留 {ctx.session.turn_count} 轮")
+            return
+
+        # ── /skills ───────────────────────────────────────────────────────────
+        if lower == "/skills":
+            await reply_func(list_skills_text())
+            return
+
+        # ── /skill <子命令|name> ... ──────────────────────────────────────────
+        if lower.startswith("/skill "):
+            arg   = content[7:].strip()
+            parts = arg.split(None, 1)
+            sub   = parts[0].lower()
+            rest  = parts[1] if len(parts) > 1 else ""
+
+            # /skill new <name> <description>
+            if sub == "new":
+                sub_parts = rest.split(None, 1)
+                if not sub_parts:
+                    await reply_func("用法：/skill new <name> <描述>")
+                    return
+                s_name = sub_parts[0]
+                s_desc = sub_parts[1] if len(sub_parts) > 1 else ""
+                await reply_func(create_skill(s_name, s_desc))
+                return
+
+            # /skill write <name> <content>
+            if sub == "write":
+                sub_parts = rest.split(None, 1)
+                if len(sub_parts) < 2:
+                    await reply_func("用法：/skill write <name> <SKILL.md 内容>")
+                    return
+                await reply_func(write_skill(sub_parts[0], sub_parts[1]))
+                return
+
+            # /skill del <name>
+            if sub == "del":
+                if not rest:
+                    await reply_func("用法：/skill del <name>")
+                    return
+                await reply_func(delete_skill(rest.strip()))
+                return
+
+            # /skill <name>          → 查看内容
+            # /skill <name> <消息>  → 激活 skill 处理任务
+            skill_name = sub
+            skill_msg  = rest
+            if not skill_msg:
+                await reply_func(load_skill(skill_name)[:3000])
+                return
+            backend = ctx.session.backend
+            try:
+                if backend == "codex":
+                    injected = f"请先调用 read_skill('{skill_name}') 获取指令，再完成：{skill_msg}"
+                    reply = await asyncio.to_thread(
+                        self._codex.chat, self._sessions, session_id, injected
+                    ) if self._codex else "⚠️ Codex 未配置"
+                elif backend == "codex-cli":
+                    skill_ctx = load_skill(skill_name)
+                    injected  = f"[Skill: {skill_name}]\n{skill_ctx}\n\n请按以上指令完成：{skill_msg}"
+                    reply = await asyncio.to_thread(
+                        self._codex_cli.chat, self._sessions, session_id, injected
+                    ) if self._codex_cli else "⚠️ Codex CLI 未配置"
+                else:
+                    reply = await asyncio.to_thread(
+                        self._claude.chat, self._sessions, session_id, skill_msg, skill_name
+                    )
+            except Exception as e:
+                reply = f"⚠️ 出错：{str(e)[:200]}"
+            self._update_status(session_id)
+            for part in _split(reply, MAX_MSG_LEN):
+                await reply_func(part)
             return
 
         # ── cd 命令（任意模式均直接执行）─────────────────────────────────────
@@ -408,6 +521,13 @@ class QQTerminalApp(App):
                 else:
                     reply = await asyncio.to_thread(
                         self._codex.chat, self._sessions, session_id, content
+                    )
+            elif backend == "codex-cli":
+                if not self._codex_cli:
+                    reply = "⚠️ Codex CLI 未配置，请先在 .env 填写配置后重启"
+                else:
+                    reply = await asyncio.to_thread(
+                        self._codex_cli.chat, self._sessions, session_id, content
                     )
             else:
                 reply = await asyncio.to_thread(

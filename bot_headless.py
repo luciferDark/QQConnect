@@ -12,10 +12,13 @@ import botpy
 from botpy.message import GroupMessage, Message, C2CMessage
 from dotenv import load_dotenv
 
-from session_manager import SessionManager, MODELS, DEFAULT_SYSTEM
+from session_manager import SessionManager, CLAUDE_MODELS, DEFAULT_SYSTEM
+import session_manager as _sm
 from claude_client import ClaudeClient
 from codex_client import CodexClient
+from codex_cli_client import CodexCliClient
 from shell_session import get_shell
+from skill_loader import list_skills_text, load_skill, create_skill, write_skill, delete_skill
 
 load_dotenv()
 
@@ -36,9 +39,24 @@ CODEX_BASE_URL = os.getenv("CODEX_BASE_URL", "")
 CODEX_API_KEY  = os.getenv("CODEX_API_KEY", "")
 CODEX_MODEL    = os.getenv("CODEX_MODEL", "")
 
+ADMIN_PORT = int(os.getenv("ADMIN_PORT", "12321"))
+
+_sm.DEFAULT_CODEX_MODEL = CODEX_MODEL   # 注入全局默认 Codex 模型
+
 _sessions = SessionManager(max_turns=MAX_TURNS)
+restored  = _sessions.restore_from_disk()
+
+import app_state
+app_state.set_sessions(_sessions)        # 暴露给 admin server
+log.info("已从磁盘恢复 %d 个用户会话", restored)
+
 _claude   = ClaudeClient(api_key=API_KEY, model=MODEL)
-_codex    = CodexClient(
+_codex     = CodexClient(
+    base_url=CODEX_BASE_URL,
+    api_key=CODEX_API_KEY,
+    model=CODEX_MODEL,
+) if CODEX_BASE_URL else None
+_codex_cli = CodexCliClient(
     base_url=CODEX_BASE_URL,
     api_key=CODEX_API_KEY,
     model=CODEX_MODEL,
@@ -93,13 +111,19 @@ async def handle_qq_message(reply_func, session_id: str, raw_content: str) -> No
         await reply_func(msg)
         return
 
-    if lower == "/codex":
+    if lower in ("/codex", "/codex api", "/codex cli"):
         if not _codex:
             await reply_func("⚠️ Codex 未配置，请在 .env 中填写 CODEX_BASE_URL / CODEX_API_KEY / CODEX_MODEL")
             return
-        ctx.session.backend = "codex"
+        sub = lower.split()[-1]
+        if sub == "cli":
+            ctx.session.backend = "codex-cli"
+            label = "Codex CLI（openai api chat.completions.create）"
+        else:
+            ctx.session.backend = "codex"
+            label = "Codex API（SDK）"
         ctx.clear()
-        await reply_func(f"🤖 已切换到 Codex 模式（{CODEX_MODEL}）\n历史已清空")
+        await reply_func(f"🤖 已切换到 {label}\n模型：{CODEX_MODEL}，历史已清空")
         return
 
     if lower == "/claude":
@@ -143,13 +167,22 @@ async def handle_qq_message(reply_func, session_id: str, raw_content: str) -> No
         return
 
     if lower == "/models":
-        lines = ["可用模型："]
-        seen = set()
-        for alias, full in MODELS.items():
-            if full not in seen and len(alias) <= 6:
-                marker = "▶" if full == ctx.session.model else " "
-                lines.append(f"  {marker} {alias:<8} → {full}")
-                seen.add(full)
+        backend = ctx.session.backend
+        if backend == "claude":
+            lines = ["Claude 可用模型："]
+            seen = set()
+            for alias, full in CLAUDE_MODELS.items():
+                if full not in seen and len(alias) <= 6:
+                    marker = "▶" if full == ctx.session.model else " "
+                    lines.append(f"  {marker} {alias:<8} → {full}")
+                    seen.add(full)
+        else:
+            cur = ctx.session.codex_model or CODEX_MODEL
+            lines = [
+                f"Codex 当前模型：{cur}",
+                "",
+                "用 /model <模型名> 切换到任意模型",
+            ]
         await reply_func("\n".join(lines))
         return
 
@@ -185,19 +218,22 @@ async def handle_qq_message(reply_func, session_id: str, raw_content: str) -> No
         return
 
     if lower == "/model" or lower.startswith("/model "):
-        arg = content[6:].strip()
+        arg     = content[6:].strip()
+        backend = ctx.session.backend
         if not arg:
-            await reply_func(f"当前模型：{ctx.session.model}")
+            await reply_func(f"当前模型：{ctx.session.active_model}")
             return
-        key = arg.lower()
-        if key not in MODELS:
-            await reply_func(
-                f"未知模型：{arg}\n"
-                f"可用别名：{', '.join(k for k in MODELS if len(k) <= 6)}"
-            )
-            return
-        ctx.session.model = MODELS[key]
-        await reply_func(f"✅ 已将当前会话模型切换为：{ctx.session.model}")
+        if backend == "claude":
+            key = arg.lower()
+            if key not in CLAUDE_MODELS:
+                aliases = ", ".join(k for k in CLAUDE_MODELS if len(k) <= 6)
+                await reply_func(f"未知 Claude 模型：{arg}\n可用别名：{aliases}")
+                return
+            ctx.session.model = CLAUDE_MODELS[key]
+            await reply_func(f"✅ Claude 模型已切换为：{ctx.session.model}")
+        else:
+            ctx.session.codex_model = arg
+            await reply_func(f"✅ Codex 模型已切换为：{arg}")
         return
 
     if lower == "/system" or lower.startswith("/system "):
@@ -222,6 +258,67 @@ async def handle_qq_message(reply_func, session_id: str, raw_content: str) -> No
             return
         ctx.session.trim_to(n)
         await reply_func(f"✅ 已裁剪，当前保留 {ctx.session.turn_count} 轮")
+        return
+
+    if lower == "/skills":
+        await reply_func(list_skills_text())
+        return
+
+    if lower.startswith("/skill "):
+        arg   = content[7:].strip()
+        parts_s = arg.split(None, 1)
+        sub   = parts_s[0].lower()
+        rest  = parts_s[1] if len(parts_s) > 1 else ""
+
+        if sub == "new":
+            sub2 = rest.split(None, 1)
+            if not sub2:
+                await reply_func("用法：/skill new <name> <描述>")
+                return
+            await reply_func(create_skill(sub2[0], sub2[1] if len(sub2) > 1 else ""))
+            return
+
+        if sub == "write":
+            sub2 = rest.split(None, 1)
+            if len(sub2) < 2:
+                await reply_func("用法：/skill write <name> <SKILL.md 内容>")
+                return
+            await reply_func(write_skill(sub2[0], sub2[1]))
+            return
+
+        if sub == "del":
+            if not rest:
+                await reply_func("用法：/skill del <name>")
+                return
+            await reply_func(delete_skill(rest.strip()))
+            return
+
+        skill_name = sub
+        skill_msg  = rest
+        if not skill_msg:
+            await reply_func(load_skill(skill_name)[:3000])
+            return
+        backend = ctx.session.backend
+        try:
+            if backend == "codex":
+                injected = f"请先调用 read_skill('{skill_name}') 获取指令，再完成：{skill_msg}"
+                reply = await asyncio.to_thread(
+                    _codex.chat, _sessions, session_id, injected
+                ) if _codex else "⚠️ Codex 未配置"
+            elif backend == "codex-cli":
+                skill_ctx = load_skill(skill_name)
+                injected  = f"[Skill: {skill_name}]\n{skill_ctx}\n\n请按以上指令完成：{skill_msg}"
+                reply = await asyncio.to_thread(
+                    _codex_cli.chat, _sessions, session_id, injected
+                ) if _codex_cli else "⚠️ Codex CLI 未配置"
+            else:
+                reply = await asyncio.to_thread(
+                    _claude.chat, _sessions, session_id, skill_msg, skill_name
+                )
+        except Exception as e:
+            reply = f"⚠️ 出错：{str(e)[:200]}"
+        for part in _split(reply, MAX_MSG_LEN):
+            await reply_func(part)
         return
 
     if content == "cd" or content.startswith("cd ") or content.startswith("cd\t"):
@@ -255,6 +352,11 @@ async def handle_qq_message(reply_func, session_id: str, raw_content: str) -> No
                 reply = "⚠️ Codex 未配置，请先在 .env 填写配置后重启，或用 /claude 切换回 Claude"
             else:
                 reply = await asyncio.to_thread(_codex.chat, _sessions, session_id, content)
+        elif backend == "codex-cli":
+            if not _codex_cli:
+                reply = "⚠️ Codex CLI 未配置，请先在 .env 填写配置后重启"
+            else:
+                reply = await asyncio.to_thread(_codex_cli.chat, _sessions, session_id, content)
         else:
             reply = await asyncio.to_thread(_claude.chat, _sessions, session_id, content)
     except Exception as e:
@@ -316,10 +418,18 @@ def _short_sid(sid: str) -> str:
 #  入口
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+async def _main():
+    from admin_server import start_admin
     intents = botpy.Intents(
         public_guild_messages=True,
         public_messages=True,
     )
     client = BotClient(intents=intents)
-    client.run(appid=QQ_APP_ID, secret=QQ_APP_SECRET)
+    log.info("Admin UI 启动于 http://localhost:%d", ADMIN_PORT)
+    await asyncio.gather(
+        start_admin(ADMIN_PORT),
+        client.start(appid=QQ_APP_ID, secret=QQ_APP_SECRET),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(_main())
